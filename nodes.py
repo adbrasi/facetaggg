@@ -146,12 +146,15 @@ def build_crops(
 
 def build_crops_locked_center(
     boxes: list[Box], frame_size: tuple[int, int], output_size: tuple[int, int],
-    padding: float, smoothing: float,
+    padding: float, smoothing: float, zoom_mode: str = "fixed", zoom_percentile: float = 95.0,
 ) -> list[tuple[float, float, float, float]]:
     """locked_center framing: the crop is centered exactly on the subject and its
     size is auto-zoomed so the window always fits inside the frame. No padding,
     no mirror, no edge fill -- when the subject is near a border the crop simply
-    zooms in enough to stay on real pixels."""
+    zooms in enough to stay on real pixels.
+
+    zoom_mode 'fixed' locks ONE zoom level for the whole clip (no depth breathing);
+    'smooth' lets the zoom follow the subject size over time."""
     frame_width, frame_height = frame_size
     aspect = output_size[0] / output_size[1]
     centers = np.asarray([box.center for box in boxes], dtype=np.float64)
@@ -160,9 +163,14 @@ def build_crops_locked_center(
         dtype=np.float64,
     )
     smooth_centers = zero_phase_ema(centers, smoothing)
-    smooth_widths = np.exp(zero_phase_ema(np.log(widths), smoothing))
+    if zoom_mode == "fixed":
+        # One constant zoom for the whole clip; near-edge frames may still tighten
+        # (the per-frame max_width clamp below) so the crop never leaves the frame.
+        target_widths = np.full(len(boxes), float(np.percentile(widths, zoom_percentile)))
+    else:
+        target_widths = np.exp(zero_phase_ema(np.log(widths), smoothing))
     crops = []
-    for (cx, cy), desired in zip(smooth_centers, smooth_widths):
+    for (cx, cy), desired in zip(smooth_centers, target_widths):
         cx = float(np.clip(cx, 1.0, frame_width - 1.0))
         cy = float(np.clip(cy, 1.0, frame_height - 1.0))
         # Largest crop that stays centered on (cx, cy) without leaving the frame.
@@ -283,8 +291,9 @@ class FaceTagCrop:
                 "zoom_percentile": ("FLOAT", {"default": 95.0, "min": 50.0, "max": 100.0, "step": 0.5}),
                 "mask_mode": (["follow_detection", "locked_center", "full_frame"],
                               {"tooltip": "follow_detection: steady camera, mask tracks the box inside the crop. "
-                                          "locked_center: subject nailed to the center, the crop auto-zooms to stay "
-                                          "inside the frame (no padding/mirror; zoom_mode is ignored). "
+                                          "locked_center: subject nailed to the center, crop auto-zooms to stay "
+                                          "inside the frame (no padding/mirror). zoom_mode=fixed locks one zoom "
+                                          "for the whole clip; smooth lets it breathe with the subject. "
                                           "full_frame: NO crop -- keep the original scene and just output the face "
                                           "mask (padding expands the mask box; width/height/zoom are ignored)"}),
                 "max_gap": ("INT", {"default": 12, "min": 0, "max": 300,
@@ -350,8 +359,10 @@ class FaceTagCrop:
         if mask_mode == "locked_center" and not used_fallback:
             # Subject nailed to the center; the crop auto-zooms to stay inside the
             # frame. No borders are ever sampled, so there is no mirror/edge fill.
+            # zoom_mode=fixed locks one zoom level for the whole clip.
             crops = build_crops_locked_center(
                 boxes, (frame_width, frame_height), output_size, padding, smoothing,
+                zoom_mode, zoom_percentile,
             )
         else:
             crops = build_crops(
