@@ -214,6 +214,11 @@ def detect_batch(
     return detections
 
 
+def _snap_to_32(value: int) -> int:
+    """Round to the nearest multiple of 32 (many samplers/VAEs require it)."""
+    return max(32, int(round(value / 32.0)) * 32)
+
+
 def _mask_preview(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Green translucent overlay + yellow contour; returns RGB float 0..1."""
     preview = bgr.astype(np.float32)
@@ -293,6 +298,11 @@ class FaceTagCrop:
                 (frame_width, frame_height),
             )
 
+        snapped_w, snapped_h = _snap_to_32(output_width), _snap_to_32(output_height)
+        if (snapped_w, snapped_h) != (output_width, output_height):
+            print(f"[FaceTag] output size {output_width}x{output_height} -> {snapped_w}x{snapped_h} "
+                  f"(snapped to a multiple of 32)")
+        output_width, output_height = snapped_w, snapped_h
         output_size = (output_width, output_height)
         if mask_mode == "locked_center" and not used_fallback:
             # Subject nailed to the center; the crop auto-zooms to stay inside the
@@ -373,9 +383,15 @@ class FaceTagCrop:
     ):
         """No crop: keep the original scene, output just the face mask over it."""
         frame_width, frame_height = frame_size
+        # Downstream inpaint/samplers usually require multiples of 32; snap the scene
+        # to the nearest one (a sub-1% resize, keeps the full frame).
+        out_w, out_h = _snap_to_32(frame_width), _snap_to_32(frame_height)
+        if (out_w, out_h) != (frame_width, frame_height):
+            print(f"[FaceTag] full_frame {frame_width}x{frame_height} -> {out_w}x{out_h} "
+                  f"(snapped to a multiple of 32)")
         count = len(frames_bgr)
-        out_images = np.empty((count, frame_height, frame_width, 3), dtype=np.float32)
-        out_masks = np.empty((count, frame_height, frame_width), dtype=np.float32)
+        out_images = np.empty((count, out_h, out_w, 3), dtype=np.float32)
+        out_masks = np.empty((count, out_h, out_w), dtype=np.float32)
         out_previews = np.empty_like(out_images)
         for index, (frame, box) in enumerate(zip(frames_bgr, boxes)):
             raw_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
@@ -395,16 +411,19 @@ class FaceTagCrop:
             if mask_feather > 0:
                 kernel = mask_feather * 2 + 1
                 mask = cv2.GaussianBlur(mask, (kernel, kernel), 0)
+            if (out_w, out_h) != (frame_width, frame_height):
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                mask = cv2.resize(mask, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
             out_images[index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             out_masks[index] = mask
             out_previews[index] = _mask_preview(frame, mask)
 
         # A no-op paste_data so the graph type still lines up (paste = identity here).
-        placements = [(0.0, 0.0, frame_width, frame_height)] * count
+        placements = [(0.0, 0.0, out_w, out_h)] * count
         paste_data = {
             "originals": image.cpu(),
             "placements": placements,
-            "output_size": (frame_width, frame_height),
+            "output_size": (out_w, out_h),
             "frame_size": (frame_width, frame_height),
         }
         return (
