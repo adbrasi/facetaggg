@@ -492,6 +492,14 @@ INTERPOLATIONS = {
     "area": cv2.INTER_AREA,
 }
 
+# warpAffine does not support INTER_AREA; fall back to linear for the paste warp.
+_WARP_SAFE = {cv2.INTER_LANCZOS4, cv2.INTER_CUBIC, cv2.INTER_LINEAR, cv2.INTER_NEAREST}
+
+
+def warp_matrix(tx: float, ty: float) -> np.ndarray:
+    """Pure sub-pixel translation matrix for cv2.warpAffine."""
+    return np.array([[1.0, 0.0, float(tx)], [0.0, 1.0, float(ty)]], dtype=np.float32)
+
 
 def _batch_item(tensor: torch.Tensor, index: int) -> np.ndarray:
     array = tensor[min(index, tensor.shape[0] - 1)].cpu().numpy()
@@ -571,6 +579,7 @@ class FaceTagPaste:
     ):
         placements = paste_data["placements"]
         interp = INTERPOLATIONS[interpolation]
+        warp_interp = interp if interp in _WARP_SAFE else cv2.INTER_LINEAR
         base_frames: torch.Tensor = background if background is not None else paste_data["originals"]
         base_len = base_frames.shape[0]
         place_len = len(placements)
@@ -610,38 +619,34 @@ class FaceTagPaste:
                 patch_mask = cv2.GaussianBlur(patch_mask, (ksize, ksize), 0)
             patch_mask = np.clip(patch_mask, 0.0, 1.0) * float(opacity)
 
-            # Intersection of the crop rectangle with the actual frame.
-            px, py = int(round(origin_x)), int(round(origin_y))
-            sx = max(0, -px)
-            sy = max(0, -py)
-            dx = max(0, px)
-            dy = max(0, py)
-            copy_w = min(crop_w - sx, frame_width - dx)
-            copy_h = min(crop_h - sy, frame_height - dy)
-            if copy_w <= 0 or copy_h <= 0:
-                results[index] = base
-                continue
-
-            patch_region = patch[sy:sy + copy_h, sx:sx + copy_w]
-            alpha_region = patch_mask[sy:sy + copy_h, sx:sx + copy_w]
-            dst_region = base[dy:dy + copy_h, dx:dx + copy_w]
-
+            # Color-match in patch space against the exact region it covers.
             if color_match != "none":
-                patch_region = _color_transfer(
-                    patch_region, dst_region, alpha_region, color_match, color_match_strength,
+                ref = cv2.warpAffine(
+                    base, warp_matrix(origin_x, origin_y), (crop_w, crop_h),
+                    flags=warp_interp | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE,
                 )
+                patch = _color_transfer(patch, ref, patch_mask, color_match, color_match_strength)
 
-            output = base.copy()
+            # SUB-PIXEL paste: warp the patch back to its exact fractional origin.
+            # This is the precise inverse of the crop's getRectSubPix sampling, so
+            # there is no round()-to-integer drift/jitter frame to frame.
+            matrix = warp_matrix(origin_x, origin_y)
+            warped_patch = cv2.warpAffine(
+                patch, matrix, (frame_width, frame_height),
+                flags=warp_interp, borderMode=cv2.BORDER_CONSTANT, borderValue=(0.0, 0.0, 0.0),
+            )
+            warped_alpha = cv2.warpAffine(
+                patch_mask, matrix, (frame_width, frame_height),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0,
+            )
+            alpha = np.clip(warped_alpha, 0.0, 1.0)[..., None]
+
             if blend_mode == "normal":
-                alpha = alpha_region[..., None]
-                output[dy:dy + copy_h, dx:dx + copy_w] = dst_region * (1.0 - alpha) + patch_region * alpha
+                output = base * (1.0 - alpha) + warped_patch * alpha
             else:
                 # Poisson blend the pasted patch into the frame for a seamless result.
-                hard = base.copy()
-                alpha = alpha_region[..., None]
-                hard[dy:dy + copy_h, dx:dx + copy_w] = dst_region * (1.0 - alpha) + patch_region * alpha
-                binary = np.zeros((frame_height, frame_width), dtype=np.uint8)
-                binary[dy:dy + copy_h, dx:dx + copy_w] = (alpha_region > 0.05).astype(np.uint8) * 255
+                hard = base * (1.0 - alpha) + warped_patch * alpha
+                binary = (warped_alpha > 0.05).astype(np.uint8) * 255
                 ys, xs = np.nonzero(binary)
                 if len(xs) == 0:
                     output = hard
