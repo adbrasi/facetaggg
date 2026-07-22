@@ -422,6 +422,10 @@ class FaceTagPaste:
                 "mask": ("MASK", {"tooltip": "Region to paste (aligned to the crop). "
                                              "If omitted, the whole crop is pasted."}),
                 "invert_mask": ("BOOLEAN", {"default": False}),
+                "background": ("IMAGE", {"tooltip": "Optional base frames to paste onto (same resolution as "
+                                                    "the source). Use this to supply a longer/extended timeline; "
+                                                    "if omitted, the original frames are used and the last one is "
+                                                    "held for any extra inpainted frames."}),
             },
         }
 
@@ -434,17 +438,27 @@ class FaceTagPaste:
         self, paste_data: dict, image: torch.Tensor, blend_mode: str, feather: int,
         mask_expand: int, opacity: float, color_match: str, color_match_strength: float,
         interpolation: str, mask: torch.Tensor | None = None, invert_mask: bool = False,
+        background: torch.Tensor | None = None,
     ):
-        originals: torch.Tensor = paste_data["originals"]
         placements = paste_data["placements"]
         interp = INTERPOLATIONS[interpolation]
-        count = originals.shape[0]
-        results = np.empty((count, originals.shape[1], originals.shape[2], 3), dtype=np.float32)
+        base_frames: torch.Tensor = background if background is not None else paste_data["originals"]
+        base_len = base_frames.shape[0]
+        place_len = len(placements)
+
+        # The output timeline follows the (possibly extended) inpainted sequence.
+        # When it is longer than what the crop captured, hold the last background
+        # frame and last crop placement for the extra frames (inpaint + extend).
+        count = image.shape[0]
+        if count != base_len:
+            print(f"[FaceTag] paste: {count} inpainted frames vs {base_len} background frames; "
+                  f"holding the last background/placement for the extras")
+        results = np.empty((count, base_frames.shape[1], base_frames.shape[2], 3), dtype=np.float32)
 
         for index in range(count):
-            base = originals[index].cpu().numpy().astype(np.float32)
+            base = base_frames[min(index, base_len - 1)].cpu().numpy().astype(np.float32)
             frame_height, frame_width = base.shape[:2]
-            origin_x, origin_y, crop_w, crop_h = placements[index]
+            origin_x, origin_y, crop_w, crop_h = placements[min(index, place_len - 1)]
             crop_w, crop_h = int(crop_w), int(crop_h)
 
             patch = _batch_item(image, index).astype(np.float32)
