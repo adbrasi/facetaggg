@@ -214,6 +214,19 @@ def detect_batch(
     return detections
 
 
+def _mask_preview(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Green translucent overlay + yellow contour; returns RGB float 0..1."""
+    preview = bgr.astype(np.float32)
+    alpha = (mask * 0.35)[..., None]
+    green = np.array([60.0, 220.0, 60.0], dtype=np.float32)
+    preview = (preview * (1.0 - alpha) + green * alpha).astype(np.uint8)
+    contours, _ = cv2.findContours(
+        (mask >= 0.5).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    cv2.drawContours(preview, contours, -1, (0, 255, 255), 2, cv2.LINE_AA)
+    return cv2.cvtColor(preview, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+
 class FaceTagCrop:
     @classmethod
     def INPUT_TYPES(cls):
@@ -230,10 +243,12 @@ class FaceTagCrop:
                                         "tooltip": "Temporal smoothing across the batch (video frames)"}),
                 "zoom_mode": (["fixed", "smooth"], {"tooltip": "fixed: one zoom level for the whole batch"}),
                 "zoom_percentile": ("FLOAT", {"default": 95.0, "min": 50.0, "max": 100.0, "step": 0.5}),
-                "mask_mode": (["follow_detection", "locked_center"],
+                "mask_mode": (["follow_detection", "locked_center", "full_frame"],
                               {"tooltip": "follow_detection: steady camera, mask tracks the box inside the crop. "
                                           "locked_center: subject nailed to the center, the crop auto-zooms to stay "
-                                          "inside the frame (no padding/mirror; zoom_mode is ignored)"}),
+                                          "inside the frame (no padding/mirror; zoom_mode is ignored). "
+                                          "full_frame: NO crop -- keep the original scene and just output the face "
+                                          "mask (padding expands the mask box; width/height/zoom are ignored)"}),
                 "max_gap": ("INT", {"default": 12, "min": 0, "max": 300,
                                     "tooltip": "Max missing-frame gap bridged by interpolation"}),
                 "mask_feather": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1,
@@ -271,6 +286,12 @@ class FaceTagCrop:
         boxes, used_fallback = fill_missing(selected, max_gap, (frame_width, frame_height))
         if used_fallback:
             print(f"[FaceTag] no detections in the whole batch (model={model_name}); using full-frame fallback")
+
+        if mask_mode == "full_frame":
+            return self._full_frame(
+                frames_bgr, boxes, image, padding, mask_feather, used_fallback,
+                (frame_width, frame_height),
+            )
 
         output_size = (output_width, output_height)
         if mask_mode == "locked_center" and not used_fallback:
@@ -328,24 +349,62 @@ class FaceTagCrop:
                 kernel = mask_feather * 2 + 1
                 mask = cv2.GaussianBlur(mask, (kernel, kernel), 0)
 
-            preview = output.astype(np.float32)
-            alpha = (mask * 0.35)[..., None]
-            green = np.array([60.0, 220.0, 60.0], dtype=np.float32)
-            preview = preview * (1.0 - alpha) + green * alpha
-            contours, _ = cv2.findContours(
-                (mask >= 0.5).astype(np.uint8) * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-            )
-            preview = preview.astype(np.uint8)
-            cv2.drawContours(preview, contours, -1, (0, 255, 255), 2, cv2.LINE_AA)
-
             out_images[index] = cv2.cvtColor(output, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
             out_masks[index] = mask
-            out_previews[index] = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            out_previews[index] = _mask_preview(output, mask)
 
         paste_data = {
             "originals": image.cpu(),
             "placements": placements,
             "output_size": output_size,
+            "frame_size": (frame_width, frame_height),
+        }
+        return (
+            torch.from_numpy(out_images),
+            torch.from_numpy(out_masks),
+            torch.from_numpy(out_previews),
+            paste_data,
+        )
+
+    def _full_frame(
+        self, frames_bgr: list[np.ndarray], boxes: list[Box], image: torch.Tensor,
+        padding: float, mask_feather: int, used_fallback: bool,
+        frame_size: tuple[int, int],
+    ):
+        """No crop: keep the original scene, output just the face mask over it."""
+        frame_width, frame_height = frame_size
+        count = len(frames_bgr)
+        out_images = np.empty((count, frame_height, frame_width, 3), dtype=np.float32)
+        out_masks = np.empty((count, frame_height, frame_width), dtype=np.float32)
+        out_previews = np.empty_like(out_images)
+        for index, (frame, box) in enumerate(zip(frames_bgr, boxes)):
+            raw_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+            if used_fallback:
+                raw_mask[:] = 255
+            else:
+                cx, cy = box.center
+                width, height = box.size
+                # padding expands the mask box around the detection center.
+                half_w, half_h = width * padding / 2.0, height * padding / 2.0
+                x1 = int(np.clip(round(cx - half_w), 0, frame_width))
+                y1 = int(np.clip(round(cy - half_h), 0, frame_height))
+                x2 = int(np.clip(round(cx + half_w), 0, frame_width))
+                y2 = int(np.clip(round(cy + half_h), 0, frame_height))
+                cv2.rectangle(raw_mask, (x1, y1), (x2, y2), 255, thickness=-1)
+            mask = raw_mask.astype(np.float32) / 255.0
+            if mask_feather > 0:
+                kernel = mask_feather * 2 + 1
+                mask = cv2.GaussianBlur(mask, (kernel, kernel), 0)
+            out_images[index] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            out_masks[index] = mask
+            out_previews[index] = _mask_preview(frame, mask)
+
+        # A no-op paste_data so the graph type still lines up (paste = identity here).
+        placements = [(0.0, 0.0, frame_width, frame_height)] * count
+        paste_data = {
+            "originals": image.cpu(),
+            "placements": placements,
+            "output_size": (frame_width, frame_height),
             "frame_size": (frame_width, frame_height),
         }
         return (

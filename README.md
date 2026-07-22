@@ -42,7 +42,7 @@ Category: `image/facetag`
 | `smoothing` | Temporal smoothing (zero-phase EMA) across the batch. |
 | `zoom_mode` | `fixed` (one zoom for the whole batch) or `smooth`. |
 | `zoom_percentile` | Percentile used to pick the fixed zoom level. |
-| `mask_mode` | `follow_detection` (steady camera, mask tracks the box) or `locked_center` (static centered mask, the video moves/zooms to keep the subject on it). |
+| `mask_mode` | `follow_detection` (steady camera, mask tracks the box), `locked_center` (subject nailed to center, crop auto-zooms to stay inside the frame), or `full_frame` (NO crop — keep the original scene and just output the face mask; `padding` expands the mask box, width/height/zoom are ignored). |
 | `max_gap` | Max missing-frame gap bridged by interpolation. |
 | `mask_feather` | Gaussian blur radius on the mask edges (px). |
 | `detector_imgsz` | Inference image size for the detector. |
