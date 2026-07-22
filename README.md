@@ -44,8 +44,14 @@ Category: `image/facetag`
 | `zoom_percentile` | Percentile used to pick the fixed zoom level. |
 | `mask_mode` | `follow_detection` (steady camera, mask tracks the box), `locked_center` (subject nailed to center, crop auto-zooms to stay inside the frame), or `full_frame` (NO crop — keep the original scene and just output the face mask; `padding` expands the mask box, width/height/zoom are ignored). |
 | `max_gap` | Max missing-frame gap bridged by interpolation. |
+| `mask_grow` | Grow (+) / shrink (-) the mask before feathering, in pixels. |
 | `mask_feather` | Gaussian blur radius on the mask edges (px). |
 | `detector_imgsz` | Inference image size for the detector. |
+| `batch_size` | Frames per YOLO forward pass (bigger = more GPU use / faster). |
+| `device` | `auto`/`cuda` use the GPU when available, `cpu` forces CPU. |
+
+In `locked_center` the mask is a single fixed size for the whole batch (it does
+not breathe with the detection), so it is a stable paste target.
 
 ### Outputs
 

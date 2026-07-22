@@ -194,9 +194,14 @@ def detect_batch(
     model, frames: list[np.ndarray], confidence: float, image_size: int,
     device: str, batch_size: int = 16,
 ) -> list[list[Box]]:
+    import time
+
     half = device != "cpu"
     detections: list[list[Box]] = []
+    started = time.perf_counter()
     for start in range(0, len(frames), batch_size):
+        # Passing a list of same-size frames lets Ultralytics run one batched
+        # forward pass per chunk instead of one image at a time.
         results = model.predict(
             source=frames[start : start + batch_size],
             conf=confidence,
@@ -211,7 +216,35 @@ def detect_batch(
                 if result.boxes is not None
                 else []
             )
+    elapsed = time.perf_counter() - started
+    fps = len(frames) / elapsed if elapsed > 0 else 0.0
+    print(f"[FaceTag] detected {len(frames)} frames on device={device} half={half} "
+          f"batch={batch_size} in {elapsed:.2f}s ({fps:.1f} fps)")
     return detections
+
+
+def _resolve_device(preference: str) -> str:
+    """Map an 'auto'/'cuda'/'cpu' choice to an Ultralytics device string, and
+    warn loudly if CUDA was asked for but isn't actually usable (common on very
+    new GPUs whose PyTorch build lacks kernels -> silent CPU fallback = slow)."""
+    if preference == "cpu":
+        return "cpu"
+    if torch.cuda.is_available():
+        return "0"
+    if preference == "cuda":
+        print("[FaceTag] WARNING: device=cuda requested but torch.cuda.is_available() is False. "
+              "Running on CPU (very slow). Your PyTorch build likely does not support this GPU yet "
+              "(e.g. an RTX 5090 needs a recent CUDA 12.8+ build of PyTorch).")
+    return "cpu"
+
+
+def _grow_mask(mask: np.ndarray, grow: int) -> np.ndarray:
+    """Dilate (grow > 0) or erode (grow < 0) a float mask by |grow| pixels."""
+    if grow == 0:
+        return mask
+    ksize = 2 * abs(grow) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+    return cv2.dilate(mask, kernel) if grow > 0 else cv2.erode(mask, kernel)
 
 
 def _snap_to_32(value: int) -> int:
@@ -256,9 +289,16 @@ class FaceTagCrop:
                                           "mask (padding expands the mask box; width/height/zoom are ignored)"}),
                 "max_gap": ("INT", {"default": 12, "min": 0, "max": 300,
                                     "tooltip": "Max missing-frame gap bridged by interpolation"}),
+                "mask_grow": ("INT", {"default": 0, "min": -256, "max": 256, "step": 1,
+                                      "tooltip": "Grow (+) or shrink (-) the mask before feathering, in pixels"}),
                 "mask_feather": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1,
                                          "tooltip": "Gaussian blur radius on the mask edges, in pixels"}),
                 "detector_imgsz": ("INT", {"default": 640, "min": 256, "max": 1536, "step": 32}),
+                "batch_size": ("INT", {"default": 16, "min": 1, "max": 256, "step": 1,
+                                       "tooltip": "Frames per YOLO forward pass. Bigger = more GPU use / faster "
+                                                  "on beefy cards"}),
+                "device": (["auto", "cuda", "cpu"],
+                           {"tooltip": "auto/cuda run on GPU when available; cpu forces CPU"}),
             },
         }
 
@@ -270,16 +310,19 @@ class FaceTagCrop:
     def run(
         self, image: torch.Tensor, model_name: str, confidence: float, padding: float,
         output_width: int, output_height: int, smoothing: float, zoom_mode: str,
-        zoom_percentile: float, mask_mode: str, max_gap: int, mask_feather: int,
-        detector_imgsz: int,
+        zoom_percentile: float, mask_mode: str, max_gap: int, mask_grow: int,
+        mask_feather: int, detector_imgsz: int, batch_size: int = 16, device: str = "auto",
     ):
         frames_rgb = (image.cpu().numpy().clip(0.0, 1.0) * 255.0).round().astype(np.uint8)
-        frames_bgr = [cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) for frame in frames_rgb]
+        # Vectorized RGB->BGR (avoids a per-frame Python cv2.cvtColor call).
+        frames_bgr = [np.ascontiguousarray(frame[..., ::-1]) for frame in frames_rgb]
         frame_height, frame_width = frames_bgr[0].shape[:2]
 
-        device = "0" if torch.cuda.is_available() else "cpu"
+        run_device = _resolve_device(device)
         model = load_model(model_name)
-        detections = detect_batch(model, frames_bgr, confidence, detector_imgsz, device)
+        detections = detect_batch(
+            model, frames_bgr, confidence, detector_imgsz, run_device, batch_size,
+        )
 
         selected: list[Box | None] = []
         previous = None
@@ -294,7 +337,7 @@ class FaceTagCrop:
 
         if mask_mode == "full_frame":
             return self._full_frame(
-                frames_bgr, boxes, image, padding, mask_feather, used_fallback,
+                frames_bgr, boxes, image, padding, mask_grow, mask_feather, used_fallback,
                 (frame_width, frame_height),
             )
 
@@ -316,12 +359,21 @@ class FaceTagCrop:
                 padding, smoothing, zoom_mode, zoom_percentile,
             )
 
-        # In locked_center mode the mask size still breathes with the detection,
-        # so smooth it with the same filter used for the camera.
-        mask_sizes = None
+        # locked_center uses ONE fixed mask size for the whole batch (no breathing),
+        # so the paste target is stable. Size = high percentile of the per-frame
+        # box-in-output size, so it comfortably covers the subject on most frames.
+        fixed_mask = None
         if mask_mode == "locked_center" and not used_fallback:
-            log_sizes = np.log(np.asarray([box.size for box in boxes], dtype=np.float64))
-            mask_sizes = np.exp(zero_phase_ema(log_sizes, smoothing))
+            widths, heights = [], []
+            for box, crop in zip(boxes, crops):
+                crop_w = max(crop[2] - crop[0], 1.0)
+                crop_h = max(crop[3] - crop[1], 1.0)
+                widths.append(box.size[0] / crop_w * output_width)
+                heights.append(box.size[1] / crop_h * output_height)
+            fixed_mask = (
+                float(np.percentile(widths, 90.0)),
+                float(np.percentile(heights, 90.0)),
+            )
 
         out_images = np.empty((len(frames_bgr), output_height, output_width, 3), dtype=np.float32)
         out_masks = np.empty((len(frames_bgr), output_height, output_width), dtype=np.float32)
@@ -335,11 +387,8 @@ class FaceTagCrop:
 
             if used_fallback:
                 mask = np.ones((output_height, output_width), dtype=np.float32)
-            elif mask_sizes is not None:
-                crop_width = max(crop[2] - crop[0], 1.0)
-                crop_height = max(crop[3] - crop[1], 1.0)
-                mask_width = float(mask_sizes[index][0]) / crop_width * output_width
-                mask_height = float(mask_sizes[index][1]) / crop_height * output_height
+            elif fixed_mask is not None:
+                mask_width, mask_height = fixed_mask
                 raw_mask = np.zeros((output_height, output_width), dtype=np.uint8)
                 x1 = int(round((output_width - mask_width) / 2))
                 y1 = int(round((output_height - mask_height) / 2))
@@ -355,6 +404,7 @@ class FaceTagCrop:
                 y2 = int(round(box.y2 - origin[1]))
                 cv2.rectangle(raw_mask, (x1, y1), (x2, y2), 255, thickness=-1)
                 mask = cv2.resize(raw_mask, output_size, interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+            mask = _grow_mask(mask, mask_grow)
             if mask_feather > 0:
                 kernel = mask_feather * 2 + 1
                 mask = cv2.GaussianBlur(mask, (kernel, kernel), 0)
@@ -378,7 +428,7 @@ class FaceTagCrop:
 
     def _full_frame(
         self, frames_bgr: list[np.ndarray], boxes: list[Box], image: torch.Tensor,
-        padding: float, mask_feather: int, used_fallback: bool,
+        padding: float, mask_grow: int, mask_feather: int, used_fallback: bool,
         frame_size: tuple[int, int],
     ):
         """No crop: keep the original scene, output just the face mask over it."""
@@ -408,6 +458,7 @@ class FaceTagCrop:
                 y2 = int(np.clip(round(cy + half_h), 0, frame_height))
                 cv2.rectangle(raw_mask, (x1, y1), (x2, y2), 255, thickness=-1)
             mask = raw_mask.astype(np.float32) / 255.0
+            mask = _grow_mask(mask, mask_grow)
             if mask_feather > 0:
                 kernel = mask_feather * 2 + 1
                 mask = cv2.GaussianBlur(mask, (kernel, kernel), 0)
